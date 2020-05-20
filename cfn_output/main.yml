@@ -1,0 +1,243 @@
+AWSTemplateFormatVersion: 2010-09-09
+Outputs:
+  ProdLBEndpoint:
+    Description: The DNS name for the prod LB
+    Export:
+      Name: ProdLBEndpoint
+    Value:
+      Fn::GetAtt:
+      - Prod
+      - Outputs.LBEndpoint
+  StagingLBEndpoint:
+    Description: The DNS name for the staging LB
+    Export:
+      Name: StagingLBEndpoint
+    Value:
+      Fn::GetAtt:
+      - Staging
+      - Outputs.LBEndpoint
+Parameters:
+  CodePipelineBucket:
+    Description: The S3 bucket for CodePipeline artifacts.
+    Type: String
+  Domain:
+    Type: String
+  EC2AMI:
+    Default: /aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2
+    Type: AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>
+  EC2InstanceType:
+    Type: String
+  GitHubBranch:
+    Default: master
+    Description: The source GitHub branch.
+    Type: String
+  GitHubOwner:
+    Description: The username of the source GitHub repo.
+    Type: String
+  GitHubPersonalAccessToken:
+    Description: A GitHub personal access token with "repo" and "admin:repo_hook"
+      permissions.
+    NoEcho: true
+    Type: String
+  GitHubRepo:
+    Description: The source GitHub repo name (without the username).
+    Type: String
+Resources:
+  BuildProject:
+    Properties:
+      Artifacts:
+        Type: CODEPIPELINE
+      Environment:
+        ComputeType: BUILD_GENERAL1_SMALL
+        Image: aws/codebuild/standard:2.0
+        Type: LINUX_CONTAINER
+      Name:
+        Ref: AWS::StackName
+      ServiceRole:
+        Fn::GetAtt:
+        - DeploymentRole
+        - Arn
+      Source:
+        Type: CODEPIPELINE
+    Type: AWS::CodeBuild::Project
+  DeploymentApplication:
+    Properties:
+      ApplicationName:
+        Ref: AWS::StackName
+      ComputePlatform: Server
+    Type: AWS::CodeDeploy::Application
+  DeploymentRole:
+    Properties:
+      AssumeRolePolicyDocument:
+        Statement:
+          Action: sts:AssumeRole
+          Effect: Allow
+          Principal:
+            Service:
+            - codepipeline.amazonaws.com
+            - codedeploy.amazonaws.com
+            - codebuild.amazonaws.com
+        Version: '2012-10-17'
+      ManagedPolicyArns:
+      - arn:aws:iam::aws:policy/PowerUserAccess
+    Type: AWS::IAM::Role
+  Pipeline:
+    Properties:
+      ArtifactStore:
+        Location:
+          Ref: CodePipelineBucket
+        Type: S3
+      Name:
+        Ref: AWS::StackName
+      RoleArn:
+        Fn::GetAtt:
+        - DeploymentRole
+        - Arn
+      Stages:
+      - Actions:
+        - ActionTypeId:
+            Category: Source
+            Owner: ThirdParty
+            Provider: GitHub
+            Version: 1
+          Configuration:
+            Branch:
+              Ref: GitHubBranch
+            OAuthToken:
+              Ref: GitHubPersonalAccessToken
+            Owner:
+              Ref: GitHubOwner
+            PollForSourceChanges: false
+            Repo:
+              Ref: GitHubRepo
+          Name: Source
+          OutputArtifacts:
+          - Name: Source
+          RunOrder: 1
+        Name: Source
+      - Actions:
+        - ActionTypeId:
+            Category: Build
+            Owner: AWS
+            Provider: CodeBuild
+            Version: 1
+          Configuration:
+            ProjectName:
+              Ref: BuildProject
+          InputArtifacts:
+          - Name: Source
+          Name: Build
+          OutputArtifacts:
+          - Name: Build
+          RunOrder: 1
+        Name: Build
+      - Actions:
+        - ActionTypeId:
+            Category: Deploy
+            Owner: AWS
+            Provider: CodeDeploy
+            Version: 1
+          Configuration:
+            ApplicationName:
+              Ref: DeploymentApplication
+            DeploymentGroupName:
+              Ref: StagingDeploymentGroup
+          InputArtifacts:
+          - Name: Build
+          Name: Staging
+          RunOrder: 1
+        Name: Staging
+      - Actions:
+        - ActionTypeId:
+            Category: Deploy
+            Owner: AWS
+            Provider: CodeDeploy
+            Version: 1
+          Configuration:
+            ApplicationName:
+              Ref: DeploymentApplication
+            DeploymentGroupName:
+              Ref: ProdDeploymentGroup
+          InputArtifacts:
+          - Name: Build
+          Name: Prod
+          RunOrder: 1
+        Name: Prod
+    Type: AWS::CodePipeline::Pipeline
+  PipelineWebhook:
+    Properties:
+      Authentication: GITHUB_HMAC
+      AuthenticationConfiguration:
+        SecretToken:
+          Ref: GitHubPersonalAccessToken
+      Filters:
+      - JsonPath: $.ref
+        MatchEquals: refs/heads/{Branch}
+      Name:
+        Fn::Sub: webhook-${AWS::StackName}
+      RegisterWithThirdParty: true
+      TargetAction: Source
+      TargetPipeline:
+        Ref: Pipeline
+      TargetPipelineVersion:
+        Fn::GetAtt:
+        - Pipeline
+        - Version
+    Type: AWS::CodePipeline::Webhook
+  Prod:
+    DependsOn: Staging
+    Properties:
+      Parameters:
+        Domain:
+          Ref: Domain
+        EC2AMI:
+          Ref: EC2AMI
+        EC2InstanceType:
+          Ref: EC2InstanceType
+        SubDomain: prod
+      TemplateURL: https://s3.amazonaws.com/awsbootstrap-cfn-134973801584/88f1695672571609ac283b2345050cfa.template
+      TimeoutInMinutes: 30
+    Type: AWS::CloudFormation::Stack
+  ProdDeploymentGroup:
+    Properties:
+      ApplicationName:
+        Ref: DeploymentApplication
+      AutoScalingGroups:
+      - Fn::GetAtt:
+        - Prod
+        - Outputs.ScalingGroup
+      DeploymentConfigName: CodeDeployDefault.OneAtATime
+      DeploymentGroupName: prod
+      ServiceRoleArn:
+        Fn::GetAtt:
+        - DeploymentRole
+        - Arn
+    Type: AWS::CodeDeploy::DeploymentGroup
+  Staging:
+    Properties:
+      Parameters:
+        Domain:
+          Ref: Domain
+        EC2AMI:
+          Ref: EC2AMI
+        EC2InstanceType:
+          Ref: EC2InstanceType
+        SubDomain: staging
+      TemplateURL: https://s3.amazonaws.com/awsbootstrap-cfn-134973801584/88f1695672571609ac283b2345050cfa.template
+      TimeoutInMinutes: 30
+    Type: AWS::CloudFormation::Stack
+  StagingDeploymentGroup:
+    Properties:
+      ApplicationName:
+        Ref: DeploymentApplication
+      AutoScalingGroups:
+      - Fn::GetAtt:
+        - Staging
+        - Outputs.ScalingGroup
+      DeploymentConfigName: CodeDeployDefault.AllAtOnce
+      DeploymentGroupName: staging
+      ServiceRoleArn:
+        Fn::GetAtt:
+        - DeploymentRole
+        - Arn
+    Type: AWS::CodeDeploy::DeploymentGroup
